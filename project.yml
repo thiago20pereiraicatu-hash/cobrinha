@@ -9,6 +9,8 @@ targets:
     deploymentTarget: "14.0"
     sources:
       - path: Sources
+      - path: AppIcon60x60@2x.png
+      - path: AppIcon60x60@3x.png
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: com.dj.cobrinha
