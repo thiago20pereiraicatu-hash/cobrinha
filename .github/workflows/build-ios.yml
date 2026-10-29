@@ -1,0 +1,39 @@
+name: build-ipa
+on:
+  workflow_dispatch:
+  push:
+
+jobs:
+  build:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Instalar xcodegen
+        run: brew install xcodegen
+
+      - name: Gerar projeto Xcode
+        run: xcodegen
+
+      - name: Compilar (unsigned, iphoneos arm64)
+        run: |
+          xcodebuild -project Cobrinha.xcodeproj \
+            -scheme Cobrinha \
+            -configuration Release \
+            -sdk iphoneos \
+            -destination "generic/platform=iOS" \
+            CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO \
+            CONFIGURATION_BUILD_DIR="$PWD/buildout" build
+
+      - name: Empacotar IPA
+        run: |
+          mkdir -p Payload
+          cp -R "buildout/Cobrinha.app" Payload/
+          zip -r cobrinha.ipa Payload
+          ls -la cobrinha.ipa
+
+      - name: Publicar artefato
+        uses: actions/upload-artifact@v4
+        with:
+          name: cobrinha-ipa
+          path: cobrinha.ipa
