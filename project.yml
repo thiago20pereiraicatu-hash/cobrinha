@@ -1,0 +1,25 @@
+# xcodegen — gera Cobrinha.xcodeproj no runner macOS
+name: Cobrinha
+options:
+  bundleIdPrefix: com.dj
+targets:
+  Cobrinha:
+    type: application
+    platform: iOS
+    deploymentTarget: "14.0"
+    sources:
+      - path: Sources
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.dj.cobrinha
+        INFOPLIST_FILE: Sources/Info.plist
+        CODE_SIGNING_ALLOWED: "NO"
+        CODE_SIGNING_REQUIRED: "NO"
+        TARGETED_DEVICE_FAMILY: "1,2"
+        SWIFT_VERSION: "5.0"
+        ENABLE_BITCODE: "NO"
+schemes:
+  Cobrinha:
+    build:
+      targets:
+        Cobrinha: all
