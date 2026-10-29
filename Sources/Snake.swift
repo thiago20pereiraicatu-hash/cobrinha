@@ -1,6 +1,7 @@
 // linguagem: Swift 5, arquivo: Snake.swift, alvo: iOS 14+ (UIKit programatico, sem storyboard)
-// jogo da cobrinha v2: cobra rosa, obstaculos, 3 frutas (maca +1, uva +2, cereja +3), swipe continuo + tap
+// v3: wrap nas bordas, cobra veste a cor da fruta, SFX + musica via AVAudioEngine (PCM sintetizado), tela de inicio
 import UIKit
+import AVFoundation
 
 @main
 class AppDelegate: UIResponder, UIApplicationDelegate {
@@ -43,6 +44,20 @@ final class SnakeView: UIView {
     private let COLS = 21, ROWS = 21, FRUIT_SLOTS = 3, OBSTACLE_CELLS = 18
     private let FRUIT_POINTS = [1, 2, 3]
 
+    // temas de cor — padrao rosa, depois veste a fruta
+    private let THEME_HEAD: [UIColor] = [
+        UIColor(r: 255, g: 138, b: 201),
+        UIColor(r: 239, g: 99, b: 96),
+        UIColor(r: 197, g: 138, b: 249),
+        UIColor(r: 255, g: 158, b: 199)
+    ]
+    private let THEME_TAIL: [UIColor] = [
+        UIColor(r: 214, g: 51, b: 108),
+        UIColor(r: 183, g: 28, b: 28),
+        UIColor(r: 106, g: 27, b: 154),
+        UIColor(r: 194, g: 24, b: 91)
+    ]
+
     private var snake: [Cell] = []
     private var obstacles: [Cell] = []
     private var queue: [Cell] = []
@@ -50,39 +65,252 @@ final class SnakeView: UIView {
     private var fruitKind: [Int] = [0, 0, 0]
     private var dir = Cell(x: 1, y: 0)
     private var score = 0, best = 0
-    private var paused = true, over = false, started = false
+    private var paused = true, over = false, started = false, menu = true
+    private var theme = 0
     private var timer: Timer?
     private var anchor: CGPoint?
     private var moved = false
 
-    private let pinkHead = UIColor(r: 255, g: 201, b: 229)
-    private let pinkMid = UIColor(r: 255, g: 138, b: 201)
-    private let pinkTail = UIColor(r: 214, g: 51, b: 108)
+    private var headC: UIColor { THEME_HEAD[theme] }
+
+    // ---------- audio (AVAudioEngine, PCM sintetizado) ----------
+
+    private let engine = AVAudioEngine()
+    private let nodeEat = AVAudioPlayerNode()
+    private let nodeHit = AVAudioPlayerNode()
+    private let nodeDie = AVAudioPlayerNode()
+    private let nodeSel = AVAudioPlayerNode()
+    private let nodeMusic = AVAudioPlayerNode()
+    private var bufEat: AVAudioPCMBuffer?
+    private var bufHit: AVAudioPCMBuffer?
+    private var bufDie: AVAudioPCMBuffer?
+    private var bufSel: AVAudioPCMBuffer?
+    private var bufMusic: AVAudioPCMBuffer?
+    private var audioReady = false
+    private let SR = 44100.0
 
     override init(frame: CGRect) {
         super.init(frame: frame)
         backgroundColor = UIColor(r: 8, g: 12, b: 9)
         best = UserDefaults.standard.integer(forKey: "cobrinha_best")
-        reset()
+        prepareAudioGraph()
+        reset(toMenu: true)
     }
 
     required init?(coder: NSCoder) { fatalError("sem storyboard") }
 
     deinit { NotificationCenter.default.removeObserver(self) }
 
+    // ondas basicas
+    private func osc(_ kind: Int, _ f: Double, _ t: Double) -> Double {
+        let ph = f * t
+        switch kind {
+        case 1: return sin(2 * .pi * ph) >= 0 ? 1 : -1      // quadrada
+        case 2: return 2 * asin(sin(2 * .pi * ph)) / .pi // triangulo
+        default: return sin(2 * .pi * ph)                   // seno
+        }
+    }
+
+    private func renderBuffer(dur: Double, gen: (Double, inout UInt32) -> Float) -> AVAudioPCMBuffer? {
+        let n = Int(dur * SR)
+        guard let fmt = AVAudioFormat(standardFormatWithSampleRate: SR, channels: 1),
+              let buf = AVAudioPCMBuffer(pcmFormat: fmt, frameCapacity: AVAudioFrameCount(n)) else { return nil }
+        buf.frameLength = AVAudioFrameCount(n)
+        guard let p = buf.floatChannelData?[0] else { return nil }
+        var seed: UInt32 = 8421
+        for i in 0..<n {
+            let v = max(-0.92, min(0.92, gen(Double(i) / SR, &seed)))
+            p[i] = v
+        }
+        return buf
+    }
+
+    // nota com envelope de ataque/decaimento
+    private func addNote(_ acc: inout [Float], _ s0: Int, _ d: Double, _ kind: Int, _ f: Double, _ v: Double) {
+        let n = Int(d * SR)
+        for i in 0..<n where s0 + i < acc.count {
+            let t = Double(i) / SR
+            var env = exp(-4 * t / d)
+            if t < 0.005 { env *= t / 0.005 }
+            acc[s0 + i] += Float(osc(kind, f, t) * v * env)
+        }
+    }
+
+    private func makeBuf(dur: Double, build: (inout [Float]) -> Void) -> AVAudioPCMBuffer? {
+        var acc = [Float](repeating: 0, count: Int(dur * SR))
+        build(&acc)
+        return renderBuffer(dur: dur) { t, _ in
+            let i = Int(t * self.SR)
+            return i < acc.count ? acc[i] : 0
+        }
+    }
+
+    private func prepareAudioGraph() {
+        // SFX
+        bufEat = makeBuf(dur: 0.30) { acc in
+            addNote(&acc, 0, 0.07, 1, 659, 0.5)
+            addNote(&acc, Int(0.06 * SR), 0.07, 1, 880, 0.5)
+            addNote(&acc, Int(0.12 * SR), 0.10, 1, 1319, 0.45)
+        }
+        bufSel = makeBuf(dur: 0.35) { acc in
+            addNote(&acc, 0, 0.09, 2, 523.25, 0.5)
+            addNote(&acc, Int(0.10 * SR), 0.16, 2, 784, 0.5)
+        }
+        bufHit = makeBuf(dur: 0.30) { acc in
+            // queda seno grave + ruido
+            var phase = 0.0
+            let n = Int(0.25 * SR)
+            for i in 0..<n {
+                let rel = Double(i) / Double(n)
+                phase += (160 + (50 - 160) * rel) / SR
+                acc[i] += Float(sin(2 * .pi * phase) * 0.8 * (1 - rel))
+            }
+            var seed: UInt32 = 7
+            let nn = Int(0.18 * SR)
+            var lp = 0.0
+            for i in 0..<nn {
+                seed = seed &* 1664525 &+ 1013904223
+                let white = (Double(seed >> 16) / 32768.0) - 1.0
+                lp += 0.08 * (white - lp)
+                acc[i] += Float(lp * 0.9 * exp(-6 * Double(i) / Double(nn)))
+            }
+        }
+        bufDie = makeBuf(dur: 0.75) { acc in
+            var phase = 0.0
+            let n = Int(0.45 * SR)
+            for i in 0..<n {
+                let rel = Double(i) / Double(n)
+                phase += (440 + (110 - 440) * rel) / SR
+                let w: Double = sin(2 * .pi * phase) >= 0 ? 1 : -1
+                acc[i] += Float(w * 0.5 * (1 - rel))
+            }
+            addNote(&acc, n, 0.25, 2, 110, 0.4)
+            var seed: UInt32 = 11
+            let nn = Int(0.55 * SR)
+            var lp = 0.0
+            for i in Int(0.40 * SR)..<nn {
+                seed = seed &* 1664525 &+ 1013904223
+                let white = (Double(seed >> 16) / 32768.0) - 1.0
+                lp += 0.08 * (white - lp)
+                acc[i] += Float(lp * 0.5 * exp(-6 * Double(i - Int(0.40 * SR)) / Double(nn - Int(0.40 * SR))))
+            }
+        }
+
+        // musica: 16 tempos, grave quadrada + melodia triangulo + clique no compasso
+        bufMusic = makeBuf(dur: 6.4) { acc in
+            let bass: [Double] = [110,110,87.31,87.31,130.81,130.81,98,98,110,110,87.31,87.31,98,98,82.41,82.41]
+            let lead: [Double] = [440,523.25,659.26,587.33,523.25,659.26,783.99,659.26,880,783.99,698.46,659.26,587.33,698.46,659.26,523.25]
+            let q = 0.4
+            for b in 0..<16 {
+                addNote(&acc, Int(Double(b) * q * SR), q * 0.98, 1, bass[b], 0.30)
+                addNote(&acc, Int(Double(b) * q * SR), q * 0.95, 2, lead[b], 0.24)
+                if b % 4 == 0 {
+                    var seed: UInt32 = UInt32(b + 1)
+                    let s0 = Int(Double(b) * q * SR)
+                    let nn = Int(0.05 * SR)
+                    for i in 0..<nn where s0 + i < acc.count {
+                        seed = seed &* 1664525 &+ 1013904223
+                        let white = (Double(seed >> 16) / 32768.0) - 1.0
+                        acc[s0 + i] += Float(white * 0.25 * (1.0 - Double(i) / Double(nn)))
+                    }
+                }
+            }
+        }
+    }
+
+    private func audioEnsureStarted() {
+        guard !audioReady else { return }
+        let session = AVAudioSession.sharedInstance()
+        try? session.setCategory(.ambient, options: .mixWithOthers)
+        try? session.setActive(true)
+        guard let fmt = AVAudioFormat(standardFormatWithSampleRate: SR, channels: 1) else { return }
+        for node in [nodeEat, nodeHit, nodeDie, nodeSel, nodeMusic] {
+            engine.attach(node)
+            engine.connect(node, to: engine.mainMixerNode, format: fmt)
+        }
+        nodeMusic.volume = 0.4
+        engine.prepare()
+        try? engine.start()
+        audioReady = true
+    }
+
+    private func sfx(_ node: AVAudioPlayerNode, _ buf: AVAudioPCMBuffer?) {
+        guard audioReady, let b = buf else { return }
+        node.stop()
+        node.scheduleBuffer(b, at: nil, options: [], completionHandler: nil)
+        node.play()
+    }
+
+    private func musicStart() {
+        guard audioReady, let b = bufMusic else { return }
+        nodeMusic.stop()
+        nodeMusic.scheduleBuffer(b, at: nil, options: .loops, completionHandler: nil)
+        nodeMusic.play()
+    }
+
+    private func musicStop() {
+        nodeMusic.stop()
+    }
+
+    // ---------- jogo ----------
+
     private func speed() -> TimeInterval { max(0.07, 0.16 - Double(score) * 0.002) }
 
-    private func reset() {
+    private func reset(toMenu: Bool) {
         snake = [Cell(x: 10, y: 10), Cell(x: 9, y: 10), Cell(x: 8, y: 10)]
         queue = []
         dir = Cell(x: 1, y: 0)
         score = 0
-        paused = true
+        paused = false
         over = false
         started = false
+        menu = toMenu
+        theme = 0
         makeObstacles()
         for i in 0..<FRUIT_SLOTS { spawnFruit(i) }
         setNeedsDisplay()
+    }
+
+    private func startGame() {
+        menu = false
+        started = true
+        audioEnsureStarted()
+        sfx(nodeSel, bufSel)
+        musicStart()
+        arm()
+        setNeedsDisplay()
+    }
+
+    @objc func pauseGame() {
+        if started && !over && !menu { paused = true }
+        timer?.invalidate()
+        nodeMusic.pause()
+        setNeedsDisplay()
+    }
+
+    private func togglePause() {
+        if over || menu { return }
+        paused = !paused
+        if !paused {
+            arm()
+            if audioReady && !nodeMusic.isPlaying { nodeMusic.play() }
+        } else {
+            timer?.invalidate()
+            nodeMusic.pause()
+        }
+        setNeedsDisplay()
+    }
+
+    private func arm() {
+        timer?.invalidate()
+        timer = Timer.scheduledTimer(timeInterval: speed(), target: self,
+                                     selector: #selector(tick), userInfo: nil, repeats: false)
+    }
+
+    @objc private func tick() {
+        guard !paused, !over, !menu else { return }
+        step()
+        if !paused && !over { arm() }
     }
 
     private func makeObstacles() {
@@ -122,59 +350,41 @@ final class SnakeView: UIView {
         fruitKind[slot] = Int.random(in: 0..<3)
     }
 
-    @objc func pauseGame() {
-        if started && !over { paused = true }
-        timer?.invalidate()
-        setNeedsDisplay()
-    }
-
-    private func togglePause() {
-        paused = !paused
-        if !paused {
-            started = true
-            arm()
-        } else {
-            timer?.invalidate()
-        }
-        setNeedsDisplay()
-    }
-
-    private func arm() {
-        timer?.invalidate()
-        timer = Timer.scheduledTimer(timeInterval: speed(), target: self,
-                                     selector: #selector(tick), userInfo: nil, repeats: false)
-    }
-
-    @objc private func tick() {
-        guard !paused, !over else { return }
-        step()
-        arm()
-    }
+    private func wrapX(_ x: Int) -> Int { ((x % COLS) + COLS) % COLS }
+    private func wrapY(_ y: Int) -> Int { ((y % ROWS) + ROWS) % ROWS }
 
     private func step() {
         if !queue.isEmpty { dir = queue.removeFirst() }
         guard let h0 = snake.first else { return }
-        let head = Cell(x: h0.x + dir.x, y: h0.y + dir.y)
-        let hitWall = head.x < 0 || head.x >= COLS || head.y < 0 || head.y >= ROWS
-        if hitWall || snake.contains(head) || obstacles.contains(head) {
-            over = true
-            if score > best {
-                best = score
-                UserDefaults.standard.set(best, forKey: "cobrinha_best")
-            }
-            UIImpactFeedbackGenerator(style: .heavy).impactOccurred()
-            setNeedsDisplay()
-            return
-        }
+        let head = Cell(x: wrapX(h0.x + dir.x), y: wrapY(h0.y + dir.y)) // wrap nas bordas
+
+        if obstacles.contains(head) { gameOver(selfCollision: false); return }
+        if snake.contains(head) { gameOver(selfCollision: true); return }
+
         snake.insert(head, at: 0)
         var ate = -1
         for i in 0..<FRUIT_SLOTS where fruitPos[i] == head { ate = i; break }
         if ate >= 0 {
             score += FRUIT_POINTS[fruitKind[ate]]
-            spawnFruit(ate)
+            theme = fruitKind[ate] + 1 // veste a cor da fruta
+            sfx(nodeEat, bufEat)
             UIImpactFeedbackGenerator(style: .light).impactOccurred()
+            spawnFruit(ate)
         } else {
             snake.removeLast()
+        }
+        setNeedsDisplay()
+    }
+
+    private func gameOver(selfCollision: Bool) {
+        over = true
+        timer?.invalidate()
+        musicStop()
+        sfx(selfCollision ? nodeDie : nodeHit, selfCollision ? bufDie : bufHit)
+        UIImpactFeedbackGenerator(style: .heavy).impactOccurred()
+        if score > best {
+            best = score
+            UserDefaults.standard.set(best, forKey: "cobrinha_best")
         }
         setNeedsDisplay()
     }
@@ -182,9 +392,9 @@ final class SnakeView: UIView {
     // MARK: - toque
 
     private func turn(_ nd: Cell) {
-        if over { return }
+        if over || menu { return }
         let last = queue.last ?? dir
-        if (nd.x != -last.x || nd.y != -last.y) && queue.count < 2 { queue.append(nd) } // sem reversao de 180
+        if (nd.x != -last.x || nd.y != -last.y) && queue.count < 2 { queue.append(nd) }
     }
 
     override func touchesBegan(_ touches: Set<UITouch>, with event: UIEvent?) {
@@ -196,11 +406,12 @@ final class SnakeView: UIView {
         guard let a = anchor, let p = touches.first?.location(in: self) else { return }
         let dx = p.x - a.x, dy = p.y - a.y
         if max(abs(dx), abs(dy)) >= 24 {
+            if menu { startGame(); anchor = p; moved = true; return }
             let c = abs(dx) > abs(dy)
                 ? Cell(x: dx > 0 ? 1 : -1, y: 0)
                 : Cell(x: 0, y: dy > 0 ? 1 : -1)
             turn(c)
-            anchor = p // arrasto continuo: pode virar de novo sem soltar
+            anchor = p // arrasto continuo
             moved = true
             if paused && !over { togglePause() }
         }
@@ -208,7 +419,8 @@ final class SnakeView: UIView {
 
     override func touchesEnded(_ touches: Set<UITouch>, with event: UIEvent?) {
         if !moved {
-            if over { reset(); togglePause() }
+            if menu { startGame() }
+            else if over { reset(toMenu: false); startGame() }
             else { togglePause() }
         }
         anchor = nil
@@ -310,7 +522,6 @@ final class SnakeView: UIView {
             let cx = ox + CGFloat(f.x) * cell + cell / 2
             let cy = oy + CGFloat(f.y) * cell + cell / 2
 
-            // brilho radial
             let glowRGB = fruitKind[i] == 0 ? (244, 67, 54) : fruitKind[i] == 1 ? (171, 71, 188) : (255, 23, 68)
             let inner = UIColor(red: CGFloat(glowRGB.0) / 255, green: CGFloat(glowRGB.1) / 255,
                                 blue: CGFloat(glowRGB.2) / 255, alpha: 0.28)
@@ -324,7 +535,7 @@ final class SnakeView: UIView {
             }
 
             if fruitKind[i] == 0 {
-                // maçã
+                // maca
                 fillGradEllipse(ctx, CGRect(x: cx - 8 * u, y: cy - 5 * u, width: 16 * u, height: 13 * u),
                                 top: UIColor(r: 239, g: 83, b: 80), bottom: UIColor(r: 183, g: 28, b: 28))
                 ctx.setStrokeColor(UIColor(r: 121, g: 85, b: 72).cgColor)
@@ -375,10 +586,10 @@ final class SnakeView: UIView {
             }
         }
 
-        // cobra rosa — degradê da cauda à cabeça
+        // cobra — degradê da cauda à cabeça na cor do tema
         for i in stride(from: snake.count - 1, through: 0, by: -1) {
             let t = snake.count > 1 ? CGFloat(i) / CGFloat(snake.count - 1) : 0
-            let body = lerp(pinkMid, pinkTail, t: t)
+            let body = lerp(headC, THEME_TAIL[theme], t: t)
             let r = cellRect(snake[i], i == 0 ? 1 : 2)
             fillGradRect(ctx, r, radius: cell * 0.3, top: lerp(body, .white, t: 0.3), bottom: body)
         }
@@ -409,30 +620,60 @@ final class SnakeView: UIView {
         let hudFont = UIFont.monospacedSystemFont(ofSize: 14, weight: .bold)
         ("Pontos: \(score)   Recorde: \(best)" as NSString).draw(
             at: CGPoint(x: 8, y: 6),
-            withAttributes: [.font: hudFont, .foregroundColor: pinkMid])
+            withAttributes: [.font: hudFont, .foregroundColor: headC])
         ("deslize move · toque pausa · maçã +1 · uva +2 · cereja +3" as NSString).draw(
             at: CGPoint(x: 8, y: 30),
             withAttributes: [.font: UIFont.monospacedSystemFont(ofSize: 10.5, weight: .regular),
                              .foregroundColor: UIColor(r: 120, g: 128, b: 122)])
 
         // overlays
-        if over || paused {
+        if menu {
+            UIColor(white: 0.03, alpha: 0.78).setFill()
+            ctx.fill(bounds)
+            let ps = NSMutableParagraphStyle()
+            ps.alignment = .center
+            let w = bounds.width, h = bounds.height
+            ("COBRINHA" as NSString).draw(
+                in: CGRect(x: 0, y: h / 2 - 150, width: w, height: 60),
+                withAttributes: [.font: UIFont.monospacedSystemFont(ofSize: 44, weight: .bold),
+                                 .foregroundColor: headC, .paragraphStyle: ps])
+            ("maçã +1 · uva +2 · cereja +3" as NSString).draw(
+                in: CGRect(x: 0, y: h / 2 - 66, width: w, height: 24),
+                withAttributes: [.font: UIFont.monospacedSystemFont(ofSize: 13, weight: .regular),
+                                 .foregroundColor: UIColor(r: 200, g: 230, b: 201), .paragraphStyle: ps])
+            ("a cobra veste a cor da fruta que come" as NSString).draw(
+                in: CGRect(x: 0, y: h / 2 - 34, width: w, height: 20),
+                withAttributes: [.font: UIFont.monospacedSystemFont(ofSize: 11, weight: .regular),
+                                 .foregroundColor: UIColor(r: 150, g: 158, b: 152), .paragraphStyle: ps])
+            ("as bordas levam para o outro lado" as NSString).draw(
+                in: CGRect(x: 0, y: h / 2 - 10, width: w, height: 20),
+                withAttributes: [.font: UIFont.monospacedSystemFont(ofSize: 11, weight: .regular),
+                                 .foregroundColor: UIColor(r: 150, g: 158, b: 152), .paragraphStyle: ps])
+            ("TOQUE PARA COMEÇAR" as NSString).draw(
+                in: CGRect(x: 0, y: h / 2 + 55, width: w, height: 30),
+                withAttributes: [.font: UIFont.monospacedSystemFont(ofSize: 15, weight: .bold),
+                                 .foregroundColor: headC, .paragraphStyle: ps])
+            ("recorde: \(best)" as NSString).draw(
+                in: CGRect(x: 0, y: h / 2 + 118, width: w, height: 18),
+                withAttributes: [.font: UIFont.monospacedSystemFont(ofSize: 10, weight: .regular),
+                                 .foregroundColor: UIColor(r: 120, g: 128, b: 122), .paragraphStyle: ps])
+        } else if over || paused {
             UIColor(white: 0, alpha: 0.6).setFill()
             ctx.fill(bounds)
             let ps = NSMutableParagraphStyle()
             ps.alignment = .center
-            let title = over ? "FIM DE JOGO" : (started ? "PAUSADO" : "COBRINHA")
+            let title = over ? "FIM DE JOGO" : "PAUSADO"
             let sub = over ? "toque para jogar de novo — pontos: \(score)"
-                           : "toque para \(started ? "continuar" : "começar") · deslize para mover"
+                           : "toque para continuar"
             (title as NSString).draw(in: CGRect(x: 0, y: bounds.height / 2 - 44,
                                                 width: bounds.width, height: 44),
                                      withAttributes: [.font: UIFont.monospacedSystemFont(ofSize: 30, weight: .bold),
-                                                      .foregroundColor: pinkMid,
+                                                      .foregroundColor: headC,
                                                       .paragraphStyle: ps])
             (sub as NSString).draw(in: CGRect(x: 0, y: bounds.height / 2 + 10,
                                               width: bounds.width, height: 30),
                                    withAttributes: [.font: UIFont.monospacedSystemFont(ofSize: 13, weight: .regular),
-                                                    .foregroundColor: pinkMid,
+                                                    .foregroundColor: headC,
                                                     .paragraphStyle: ps])
         }
     }
